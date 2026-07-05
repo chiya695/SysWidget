@@ -1,0 +1,9 @@
+// Resource script: embeds the application manifest (and, later, the tray icon).
+#include "resource.h"
+
+// 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
+1 24 "app.manifest"
+
+// Application / tray icon. A real .ico is added in a later phase; until then the
+// app falls back to a stock icon at runtime, so this line stays commented out.
+// IDI_APP ICON "app.ico"

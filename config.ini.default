@@ -1,0 +1,38 @@
+; SysWidget configuration (portable).
+; This file is copied to "config.ini" next to the exe on first run.
+; You can edit it by hand, or use the tray menu / settings dialog in the app.
+
+[general]
+; display style: minimal (just numbers) or bars (numbers + mini bars)
+mode=minimal
+; window opacity, 0 (invisible) - 100 (opaque)
+opacity=92
+; how often to refresh, milliseconds (500 - 5000). Lower = smoother but a touch more CPU.
+refresh_ms=1000
+; last window position (updated automatically when you drag it)
+x=120
+y=120
+; keep the widget above other windows
+topmost=1
+; let mouse clicks pass through to whatever is underneath
+click_through=0
+; start together with Windows (mirrored to the registry Run key)
+autostart=0
+; hide + throttle while a fullscreen app (game/video) is running
+hide_on_fullscreen=1
+
+[show]
+; turn any line on/off independently. all off = an almost-idle empty widget.
+cpu=1
+mem=1
+ip=1
+; show the top-5 processes under CPU / memory (costs a bit more; off by default)
+cpu_top=0
+mem_top=0
+
+[colors]
+; hex RGB, no leading #
+background=1c1c1e
+text=e6e6e6
+accent=4aa3ff
+warn=ff9f43

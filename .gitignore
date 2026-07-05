@@ -1,0 +1,21 @@
+# build artifacts
+/build/
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# local runtime config (ship config.ini.default instead)
+/config.ini
+/dist/config.ini
+
+# editor junk
+.vs/
+*.user
+Thumbs.db
+
+# local test/debug scratch (never commit)
+_*.ps1
+shot*.png
