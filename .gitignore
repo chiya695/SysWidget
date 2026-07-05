@@ -1,5 +1,6 @@
 # build artifacts
 /build/
+/dist/
 *.obj
 *.res
 *.pdb
@@ -9,7 +10,7 @@
 
 # local runtime config (ship config.ini.default instead)
 /config.ini
-/dist/config.ini
+/release/config.ini
 
 # editor junk
 .vs/

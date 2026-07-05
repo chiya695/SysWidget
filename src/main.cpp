@@ -19,6 +19,7 @@ static const UINT     WM_TRAY = WM_APP + 1;
 static const UINT     TIMER_ID = 1;
 
 static HWND     g_hwnd = nullptr;
+static HINSTANCE g_hInst = nullptr;
 static Config   g_cfg;
 static Metrics  g_metrics;
 static unsigned g_tick = 0;
@@ -145,11 +146,18 @@ static void TrayAdd() {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    // our own icon at the tray's small-icon size for a crisp result
+    g_nid.hIcon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXSMICON),
+                                    GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(g_nid.szTip, L"SysWidget");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
-static void TrayRemove() { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
+static void TrayRemove() {
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    if (g_nid.hIcon) { DestroyIcon(g_nid.hIcon); g_nid.hIcon = nullptr; }
+}
 
 static void AppendCheck(HMENU m, UINT id, const wchar_t* text, bool checked) {
     AppendMenuW(m, MF_STRING | (checked ? MF_CHECKED : 0), id, text);
@@ -340,10 +348,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     Metrics_Init();
     Render_Init();
 
+    g_hInst = hInst;
+
+    HICON hBig = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
+    HICON hSmall = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                     GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon = hBig;
+    wc.hIconSm = hSmall;
     wc.lpszClassName = kClass;
     RegisterClassExW(&wc);
 

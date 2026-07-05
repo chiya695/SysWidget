@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon.png" width="96" alt="SysWidget">
+</p>
+
 # SysWidget
 
 一个挂在桌面角落的小组件，实时显示 CPU、内存和本机 IP。想看是哪些程序在吃 CPU 或内存，还能展开各自占用前 5 的进程列表。
@@ -35,12 +39,14 @@ x64 和 ARM64 都是原生编译，两个架构的机器都能直接跑，不挑
 
 ### 直接下载
 
-去 [Releases](../../releases) 或者 `dist/` 目录，按你的机器架构挑一个：
+去 [Releases 页面](../../releases/latest) 下载，按你的机器架构挑一个：
 
 - Intel / AMD 的电脑 → `SysWidget-x64.exe`
 - ARM 的电脑（骁龙本、部分 Surface 等）→ `SysWidget-arm64.exe`
 
 双击就能跑，不用装任何运行库。第一次运行会在同目录生成一个 `config.ini`，你的设置都存这儿。
+
+> 想校验下载完整性，可对照 Release 里的 `SHA256SUMS.txt`。
 
 > 拿不准自己是哪个架构？任务管理器 →「性能」→ CPU，右下角会写型号；或者设置 →「系统」→「关于」里看「系统类型」。挑错了也没事，跑不起来换另一个就是。
 
