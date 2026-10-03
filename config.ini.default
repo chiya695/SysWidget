@@ -12,8 +12,10 @@ refresh_ms=1000
 ; last window position (updated automatically when you drag it)
 x=120
 y=120
-; keep the widget above other windows
+; legacy setting, used only when window_mode is absent
 topmost=1
+; normal (not topmost), global (above apps), desktop (above desktop, below apps)
+window_mode=global
 ; let mouse clicks pass through to whatever is underneath
 click_through=0
 ; start together with Windows (mirrored to the registry Run key)

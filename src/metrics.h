@@ -32,3 +32,4 @@ void Metrics_Update(const Config& cfg, Metrics& out, unsigned tick);
 
 // Release any cached buffers.
 void Metrics_Shutdown();
+void Metrics_ResetCpu();

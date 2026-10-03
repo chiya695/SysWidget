@@ -64,8 +64,9 @@ static BYTE*  g_procBuf = nullptr;
 static ULONG  g_procBufSize = 0;
 
 // previous per-process CPU time, to turn cumulative time into a rate
-struct PrevProc { DWORD pid; ULONGLONG time; };
+struct PrevProc { DWORD pid; ULONGLONG created; ULONGLONG time; };
 static std::vector<PrevProc> g_prev;
+static ULONGLONG g_prevProcBase = 0;
 
 // previous system totals for overall CPU%
 static ULONGLONG g_prevIdle = 0, g_prevKernel = 0, g_prevUser = 0;
@@ -156,22 +157,26 @@ static void SampleIp(wchar_t* out, size_t cch) {
 }
 
 // ---- top-5 processes by CPU and by memory ----------------------------------
-static ULONGLONG FindPrev(DWORD pid) {
-    for (const auto& p : g_prev) if (p.pid == pid) return p.time;
+static ULONGLONG FindPrev(DWORD pid, ULONGLONG created) {
+    auto found = std::lower_bound(g_prev.begin(), g_prev.end(), pid,
+        [](const PrevProc& row, DWORD value) { return row.pid < value; });
+    if (found != g_prev.end() && found->pid == pid && found->created == created)
+        return found->time;
     return 0;
 }
 
 static void SampleProcs(const Config& cfg, Metrics& out) {
     out.cpuTopN = 0; out.memTopN = 0;
     if (!g_NtQSI) return;
+    const bool needCpu = cfg.showCpu && cfg.showCpuTop;
 
-    // grow the reusable buffer until the snapshot fits
+    bool snapshotReady = false;
     for (int attempt = 0; attempt < 6; ++attempt) {
         if (g_procBufSize == 0) { g_procBufSize = 512 * 1024; g_procBuf = (BYTE*)malloc(g_procBufSize); }
-        if (!g_procBuf) return;
+        if (!g_procBuf) { g_procBufSize = 0; return; }
         ULONG needed = 0;
         LONG st = g_NtQSI(SW_SystemProcessInformation, g_procBuf, g_procBufSize, &needed);
-        if (st == 0) break;
+        if (st == 0) { snapshotReady = true; break; }
         if (st == STATUS_INFO_LENGTH_MISMATCH) {
             free(g_procBuf);
             g_procBufSize = needed + 64 * 1024;
@@ -180,25 +185,24 @@ static void SampleProcs(const Config& cfg, Metrics& out) {
         }
         return; // unexpected error
     }
-    if (!g_procBuf) return;
+    if (!snapshotReady) return;
 
     struct Row { DWORD pid; double cpu; ULONGLONG mem; const wchar_t* name; USHORT nameLen; };
     std::vector<Row> rows;
     rows.reserve(g_prev.size() ? g_prev.size() : 256);
 
     std::vector<PrevProc> cur;
-    cur.reserve(rows.capacity());
+    if (needCpu) cur.reserve(rows.capacity());
 
     // wall-clock capacity since last sample = (kernel+user) delta, already tracked
     // by SampleCpu; recompute a local denominator from GetSystemTimes so this works
     // even when the CPU line is hidden.
-    static ULONGLONG prevBusyBase = 0;
     FILETIME idle, kern, user;
     ULONGLONG denom = 0;
-    if (GetSystemTimes(&idle, &kern, &user)) {
+    if (needCpu && GetSystemTimes(&idle, &kern, &user)) {
         ULONGLONG nowBase = FtToU64(kern) + FtToU64(user);
-        denom = (prevBusyBase && nowBase > prevBusyBase) ? (nowBase - prevBusyBase) : 0;
-        prevBusyBase = nowBase;
+        denom = (g_prevProcBase && nowBase > g_prevProcBase) ? (nowBase - g_prevProcBase) : 0;
+        g_prevProcBase = nowBase;
     }
 
     BYTE* p = g_procBuf;
@@ -207,7 +211,8 @@ static void SampleProcs(const Config& cfg, Metrics& out) {
         DWORD pid = (DWORD)(ULONG_PTR)spi->UniqueProcessId;
         if (pid != 0) {
             ULONGLONG t = LiToU64(spi->UserTime) + LiToU64(spi->KernelTime);
-            ULONGLONG prev = FindPrev(pid);
+            ULONGLONG created = LiToU64(spi->CreateTime);
+            ULONGLONG prev = needCpu ? FindPrev(pid, created) : 0;
             double cpu = 0.0;
             if (denom && prev && t >= prev)
                 cpu = (double)(t - prev) * 100.0 / (double)denom;
@@ -221,12 +226,15 @@ static void SampleProcs(const Config& cfg, Metrics& out) {
             row.nameLen = spi->ImageName.Buffer ? (USHORT)(spi->ImageName.Length / sizeof(WCHAR)) : 0;
             rows.push_back(row);
 
-            cur.push_back({ pid, t });
+            if (needCpu) cur.push_back({ pid, created, t });
         }
         if (spi->NextEntryOffset == 0) break;
         p += spi->NextEntryOffset;
     }
+    std::sort(cur.begin(), cur.end(),
+        [](const PrevProc& first, const PrevProc& second) { return first.pid < second.pid; });
     g_prev.swap(cur);
+    if (!needCpu) g_prevProcBase = 0;
 
     auto fill = [](ProcInfo* dst, int& n, std::vector<Row>& rws, bool byCpu) {
         std::partial_sort(rws.begin(),
@@ -248,8 +256,19 @@ static void SampleProcs(const Config& cfg, Metrics& out) {
         }
     };
 
-    if (cfg.showCpuTop) fill(out.cpuTop, out.cpuTopN, rows, true);
-    if (cfg.showMemTop) fill(out.memTop, out.memTopN, rows, false);
+    if (cfg.showCpu && cfg.showCpuTop) fill(out.cpuTop, out.cpuTopN, rows, true);
+    if (cfg.showMem && cfg.showMemTop) fill(out.memTop, out.memTopN, rows, false);
+}
+
+void Metrics_ResetCpu() {
+    FILETIME idle, kernel, user;
+    if (GetSystemTimes(&idle, &kernel, &user)) {
+        g_prevIdle = FtToU64(idle);
+        g_prevKernel = FtToU64(kernel);
+        g_prevUser = FtToU64(user);
+    }
+    g_prevProcBase = 0;
+    g_prev.clear();
 }
 
 void Metrics_Update(const Config& cfg, Metrics& out, unsigned tick) {
@@ -263,6 +282,12 @@ void Metrics_Update(const Config& cfg, Metrics& out, unsigned tick) {
         wcscpy_s(out.ip, 64, g_ipCache);
     }
 
-    if (cfg.showCpuTop || cfg.showMemTop)
+    if ((cfg.showCpu && cfg.showCpuTop) || (cfg.showMem && cfg.showMemTop))
         SampleProcs(cfg, out);
+    else {
+        out.cpuTopN = 0;
+        out.memTopN = 0;
+        g_prev.clear();
+        g_prevProcBase = 0;
+    }
 }

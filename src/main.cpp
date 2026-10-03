@@ -3,6 +3,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <dwmapi.h>
 #include <stdio.h>
 #include <string.h>
 #include "config.h"
@@ -17,6 +18,8 @@
 static const wchar_t* kClass = L"SysWidgetWindow";
 static const UINT     WM_TRAY = WM_APP + 1;
 static const UINT     TIMER_ID = 1;
+static const UINT     STATE_TIMER_ID = 2;
+static const UINT     WM_SYNC_STATE = WM_APP + 2;
 
 static HWND     g_hwnd = nullptr;
 static HINSTANCE g_hInst = nullptr;
@@ -24,6 +27,15 @@ static Config   g_cfg;
 static Metrics  g_metrics;
 static unsigned g_tick = 0;
 static bool     g_hiddenByFullscreen = false;
+static bool     g_userVisible = true;
+static bool     g_samplingPaused = false;
+static bool     g_applyingLayer = false;
+static bool     g_desktopRaised = false;
+static bool     g_dragging = false;
+static HWND     g_desktopHost = nullptr;
+static HWND     g_lastForeground = nullptr;
+static HWINEVENTHOOK g_foregroundHook = nullptr;
+static UINT     g_taskbarCreated = 0;
 static NOTIFYICONDATAW g_nid = {};
 
 // opacity / refresh presets live in these menu-id ranges
@@ -35,6 +47,14 @@ static void RefreshNow();
 static void ApplyWindowFlags();
 static void ApplyOpacity();
 static void HandleCommand(UINT id);
+static void ApplyWindowLayer();
+static void SyncWindowState(bool forceLayer = false);
+
+static void SaveConfig() {
+    if (!Config_Save(g_cfg))
+        MessageBoxW(g_hwnd, L"无法保存 config.ini。请将程序放到可写目录，并检查配置文件是否为只读。",
+                    L"SysWidget", MB_OK | MB_ICONWARNING);
+}
 
 // Hand idle pages back to the OS so the number Task Manager shows stays small.
 // The pages fault back in on demand; for a mostly-idle widget that never happens.
@@ -69,13 +89,59 @@ static void SetAutostart(bool on) {
 // ---------------------------------------------------------------------------
 // is a real fullscreen app (game / video) in the foreground?
 // ---------------------------------------------------------------------------
-static bool FullscreenActive() {
-    QUERY_USER_NOTIFICATION_STATE s;
-    if (SHQueryUserNotificationState(&s) == S_OK) {
-        if (s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE)
-            return true;
+static bool ShellWindow(HWND hwnd) {
+    if (!hwnd) return false;
+    DWORD process = 0, shellProcess = 0;
+    GetWindowThreadProcessId(hwnd, &process);
+    GetWindowThreadProcessId(GetShellWindow(), &shellProcess);
+    if (!shellProcess || process != shellProcess) return false;
+    wchar_t name[64] = {};
+    GetClassNameW(hwnd, name, 64);
+    return wcscmp(name, L"Progman") == 0 || wcscmp(name, L"WorkerW") == 0
+        || wcscmp(name, L"Shell_TrayWnd") == 0 || wcscmp(name, L"Shell_SecondaryTrayWnd") == 0;
+}
+
+static BOOL CALLBACK FindDesktopHost(HWND hwnd, LPARAM value) {
+    if (ShellWindow(hwnd) && FindWindowExW(hwnd, nullptr, L"SHELLDLL_DefView", nullptr)) {
+        *(HWND*)value = hwnd;
+        return FALSE;
     }
-    return false;
+    return TRUE;
+}
+
+static HWND DesktopHost() {
+    if (!IsWindow(g_desktopHost)
+        || !FindWindowExW(g_desktopHost, nullptr, L"SHELLDLL_DefView", nullptr)) {
+        g_desktopHost = nullptr;
+        EnumWindows(FindDesktopHost, (LPARAM)&g_desktopHost);
+    }
+    return g_desktopHost;
+}
+
+static bool FullscreenActive() {
+    HWND foreground = GetForegroundWindow();
+    if (!foreground || foreground == g_hwnd || ShellWindow(foreground)
+        || !IsWindowVisible(foreground) || IsIconic(foreground)) return false;
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(foreground, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)))
+        && cloaked) return false;
+    if (IsZoomed(foreground)) {
+        LONG_PTR style = GetWindowLongPtrW(foreground, GWL_STYLE);
+        if ((style & WS_CAPTION) == WS_CAPTION || (style & WS_THICKFRAME)) return false;
+    }
+    RECT window = {};
+    if (FAILED(DwmGetWindowAttribute(foreground, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                     &window, sizeof(window)))
+        && !GetWindowRect(foreground, &window)) return false;
+    MONITORINFO monitor = { sizeof(monitor) };
+    if (!GetMonitorInfoW(MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST), &monitor))
+        return false;
+    return window.left <= monitor.rcMonitor.left && window.top <= monitor.rcMonitor.top
+        && window.right >= monitor.rcMonitor.right && window.bottom >= monitor.rcMonitor.bottom;
+}
+
+static void CALLBACK ForegroundChanged(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_SYNC_STATE, 1, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -98,8 +164,68 @@ static void ApplyWindowFlags() {
     else                    ex &= ~WS_EX_TRANSPARENT;
     SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex);
 
-    SetWindowPos(g_hwnd, g_cfg.topMost ? HWND_TOPMOST : HWND_NOTOPMOST,
-                 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    ApplyWindowLayer();
+}
+
+static void ApplyWindowLayer() {
+    const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    g_applyingLayer = true;
+    if (g_cfg.windowMode == WindowMode::Global) {
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        SetWindowPos(g_hwnd, HWND_TOP, 0, 0, 0, 0, flags);
+    } else if (g_cfg.windowMode == WindowMode::Desktop) {
+        HWND host = DesktopHost();
+        bool hostTopmost = host && (GetWindowLongPtrW(host, GWL_EXSTYLE) & WS_EX_TOPMOST);
+        SetWindowPos(g_hwnd, hostTopmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+        HWND before = host ? GetWindow(host, GW_HWNDPREV) : nullptr;
+        if (before == g_hwnd) before = GetWindow(g_hwnd, GW_HWNDPREV);
+        HWND layer = before ? before : hostTopmost
+            ? HWND_TOPMOST : host ? HWND_TOP : HWND_BOTTOM;
+        SetWindowPos(g_hwnd, layer, 0, 0, 0, 0, flags);
+    } else {
+        SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+    }
+    g_applyingLayer = false;
+}
+
+static void SyncWindowState(bool forceLayer) {
+    if (!g_hwnd || g_dragging) return;
+    g_hiddenByFullscreen = g_cfg.hideOnFullscreen && FullscreenActive();
+    bool visible = g_userVisible && !g_hiddenByFullscreen;
+    if (!visible) {
+        if (IsWindowVisible(g_hwnd)) ShowWindow(g_hwnd, SW_HIDE);
+        g_samplingPaused = true;
+        return;
+    }
+    if (g_samplingPaused) {
+        Metrics_ResetCpu();
+        g_metrics.cpu = 0;
+        g_metrics.cpuTopN = 0;
+        g_samplingPaused = false;
+        RefreshNow();
+        forceLayer = true;
+    }
+    bool managed = g_cfg.windowMode != WindowMode::Normal;
+    if ((!IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) && (managed || forceLayer)) {
+        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+        forceLayer = true;
+    }
+    HWND host = DesktopHost();
+    bool raised = host && (GetWindowLongPtrW(host, GWL_EXSTYLE) & WS_EX_TOPMOST);
+    HWND foreground = GetForegroundWindow();
+    if (raised != g_desktopRaised || foreground != g_lastForeground) forceLayer = true;
+    g_desktopRaised = raised;
+    g_lastForeground = foreground;
+    if (g_cfg.windowMode == WindowMode::Desktop && host
+        && GetWindow(g_hwnd, GW_HWNDNEXT) != host) forceLayer = true;
+    if (g_cfg.windowMode == WindowMode::Global
+        && !(GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)) forceLayer = true;
+    if (g_cfg.windowMode == WindowMode::Global && host) {
+        for (HWND above = GetWindow(g_hwnd, GW_HWNDPREV); above; above = GetWindow(above, GW_HWNDPREV)) {
+            if (above == host) { forceLayer = true; break; }
+        }
+    }
+    if (forceLayer && managed) ApplyWindowLayer();
 }
 
 // clamp a proposed position so the widget stays reachable on some monitor
@@ -147,7 +273,7 @@ static void TrayAdd() {
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
     // our own icon at the tray's small-icon size for a crisp result
-    g_nid.hIcon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+    if (!g_nid.hIcon) g_nid.hIcon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
                                     GetSystemMetrics(SM_CXSMICON),
                                     GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
@@ -172,6 +298,8 @@ static void ShowMenu() {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendCheck(m, IDM_TOGGLE_CPUTOP, L"展开 CPU 占用前5", g_cfg.showCpuTop);
     AppendCheck(m, IDM_TOGGLE_MEMTOP, L"展开 内存占用前5", g_cfg.showMemTop);
+    if (!g_cfg.showCpu) EnableMenuItem(m, IDM_TOGGLE_CPUTOP, MF_BYCOMMAND | MF_GRAYED);
+    if (!g_cfg.showMem) EnableMenuItem(m, IDM_TOGGLE_MEMTOP, MF_BYCOMMAND | MF_GRAYED);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 
     // display mode
@@ -199,7 +327,15 @@ static void ShowMenu() {
     AppendMenuW(m, MF_POPUP, (UINT_PTR)rf, L"刷新间隔");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 
-    AppendCheck(m, IDM_TOP_MOST,      L"窗口置顶",       g_cfg.topMost);
+    HMENU layer = CreatePopupMenu();
+    AppendCheck(layer, IDM_WINDOW_NORMAL, L"不置顶", g_cfg.windowMode == WindowMode::Normal);
+    AppendCheck(layer, IDM_WINDOW_GLOBAL, L"全局置顶", g_cfg.windowMode == WindowMode::Global);
+    AppendCheck(layer, IDM_WINDOW_DESKTOP, L"仅桌面", g_cfg.windowMode == WindowMode::Desktop);
+    CheckMenuRadioItem(layer, IDM_WINDOW_NORMAL, IDM_WINDOW_DESKTOP,
+                      IDM_WINDOW_NORMAL + (UINT)g_cfg.windowMode, MF_BYCOMMAND);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)layer, L"窗口层级");
+    AppendCheck(m, IDM_HIDE_FULLSCREEN, L"全屏时自动隐藏", g_cfg.hideOnFullscreen);
+    AppendCheck(m, IDM_SHOW_HIDE, L"显示组件", g_userVisible);
     AppendCheck(m, IDM_CLICK_THROUGH, L"鼠标点击穿透",   g_cfg.clickThrough);
     AppendCheck(m, IDM_AUTOSTART,     L"开机自启",       g_cfg.autoStart);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -224,7 +360,10 @@ static void ShowMenu() {
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
 
+    if (IsWindow(fgWnd) && GetForegroundWindow() == g_hwnd) SetForegroundWindow(fgWnd);
+
     if (cmd) HandleCommand(cmd);
+    SyncWindowState(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,35 +377,57 @@ static void HandleCommand(UINT id) {
         g_cfg.refreshMs = (int)(id - IDM_REFRESH_BASE) * 100;
         SetTimer(g_hwnd, TIMER_ID, g_cfg.refreshMs, nullptr);
     } else switch (id) {
-        case IDM_TOGGLE_CPU:    g_cfg.showCpu    = !g_cfg.showCpu;    relayout = true; break;
-        case IDM_TOGGLE_MEM:    g_cfg.showMem    = !g_cfg.showMem;    relayout = true; break;
+        case IDM_TOGGLE_CPU:
+            g_cfg.showCpu = !g_cfg.showCpu;
+            if (!g_cfg.showCpu) g_cfg.showCpuTop = false;
+            Metrics_ResetCpu(); relayout = true; break;
+        case IDM_TOGGLE_MEM:
+            g_cfg.showMem = !g_cfg.showMem;
+            if (!g_cfg.showMem) g_cfg.showMemTop = false;
+            relayout = true; break;
         case IDM_TOGGLE_IP:     g_cfg.showIp     = !g_cfg.showIp;     relayout = true; break;
-        case IDM_TOGGLE_CPUTOP: g_cfg.showCpuTop = !g_cfg.showCpuTop; relayout = true; break;
-        case IDM_TOGGLE_MEMTOP: g_cfg.showMemTop = !g_cfg.showMemTop; relayout = true; break;
+        case IDM_TOGGLE_CPUTOP:
+            if (g_cfg.showCpu) { g_cfg.showCpuTop = !g_cfg.showCpuTop; Metrics_ResetCpu(); relayout = true; }
+            break;
+        case IDM_TOGGLE_MEMTOP:
+            if (g_cfg.showMem) { g_cfg.showMemTop = !g_cfg.showMemTop; relayout = true; }
+            break;
         case IDM_MODE_MINIMAL:  g_cfg.mode = DisplayMode::Minimal;    relayout = true; break;
         case IDM_MODE_BARS:     g_cfg.mode = DisplayMode::Bars;       relayout = true; break;
-        case IDM_TOP_MOST:      g_cfg.topMost = !g_cfg.topMost;       ApplyWindowFlags(); break;
+        case IDM_WINDOW_NORMAL: g_cfg.windowMode = WindowMode::Normal; ApplyWindowFlags(); break;
+        case IDM_WINDOW_GLOBAL: g_cfg.windowMode = WindowMode::Global; ApplyWindowFlags(); break;
+        case IDM_WINDOW_DESKTOP: g_cfg.windowMode = WindowMode::Desktop; ApplyWindowFlags(); break;
+        case IDM_HIDE_FULLSCREEN: g_cfg.hideOnFullscreen = !g_cfg.hideOnFullscreen; break;
+        case IDM_SHOW_HIDE: g_userVisible = !g_userVisible; saveCfg = false; break;
         case IDM_CLICK_THROUGH: g_cfg.clickThrough = !g_cfg.clickThrough; ApplyWindowFlags(); break;
         case IDM_AUTOSTART:     g_cfg.autoStart = !g_cfg.autoStart;   SetAutostart(g_cfg.autoStart); break;
         case IDM_EXIT:          DestroyWindow(g_hwnd); return;
         default: saveCfg = false; break;
     }
 
-    if (relayout) RefreshNow();
-    if (saveCfg)  Config_Save(g_cfg);
+    if (relayout && !g_samplingPaused) RefreshNow();
+    SyncWindowState(true);
+    if (saveCfg) SaveConfig();
 }
 
 // ---------------------------------------------------------------------------
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_taskbarCreated && msg == g_taskbarCreated) {
+        g_desktopHost = nullptr;
+        TrayAdd();
+        SyncWindowState(true);
+        return 0;
+    }
     switch (msg) {
+    case WM_SYNC_STATE:
+        SyncWindowState(wp != 0);
+        return 0;
     case WM_TIMER:
+        if (wp == STATE_TIMER_ID) { SyncWindowState(); return 0; }
         if (wp == TIMER_ID) {
-            if (g_cfg.hideOnFullscreen) {
-                bool fs = FullscreenActive();
-                if (fs && !g_hiddenByFullscreen) { ShowWindow(hwnd, SW_HIDE); g_hiddenByFullscreen = true; }
-                else if (!fs && g_hiddenByFullscreen) { ShowWindow(hwnd, SW_SHOWNOACTIVATE); g_hiddenByFullscreen = false; }
-                if (g_hiddenByFullscreen) return 0;   // skip sampling while hidden
-            }
+            if (g_dragging) return 0;
+            SyncWindowState();
+            if (g_samplingPaused) return 0;
             RefreshNow();
             if ((g_tick % 30) == 0) TrimWorkingSet();   // ~every 30 refreshes
         }
@@ -299,10 +460,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // whole surface acts as a drag handle
         return HTCAPTION;
 
+    case WM_WINDOWPOSCHANGING:
+        if (g_cfg.windowMode == WindowMode::Desktop && !g_applyingLayer)
+            ((WINDOWPOS*)lp)->flags |= SWP_NOZORDER;
+        break;
+
+    case WM_ENTERSIZEMOVE:
+        g_dragging = true;
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        g_desktopHost = nullptr;
+        if (!g_samplingPaused) RefreshNow();
+        SyncWindowState(true);
+        return 0;
+
     case WM_EXITSIZEMOVE: {
         RECT r; GetWindowRect(hwnd, &r);
         g_cfg.x = r.left; g_cfg.y = r.top;
-        Config_Save(g_cfg);
+        g_dragging = false;
+        SaveConfig();
+        SyncWindowState(true);
         return 0;
     }
 
@@ -314,9 +492,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) {
             ShowMenu();
         } else if (LOWORD(lp) == WM_LBUTTONDBLCLK) {
-            // double-click tray = show/hide the widget
-            if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
-            else ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            HandleCommand(IDM_SHOW_HIDE);
         }
         return 0;
 
@@ -330,8 +506,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
+        KillTimer(hwnd, STATE_TIMER_ID);
+        if (g_foregroundHook) UnhookWinEvent(g_foregroundHook);
+        g_foregroundHook = nullptr;
         TrayRemove();
-        Config_Save(g_cfg);
+        SaveConfig();
         PostQuitMessage(0);
         return 0;
     }
@@ -344,11 +523,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"SysWidget_SingleInstance");
     if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
-    Config_Load(g_cfg);
+    if (!Config_Load(g_cfg))
+        MessageBoxW(nullptr, L"无法创建或更新 config.ini。请将程序放到可写目录，并检查配置文件是否为只读。",
+                    L"SysWidget", MB_OK | MB_ICONWARNING);
     Metrics_Init();
     Render_Init();
 
     g_hInst = hInst;
+    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     HICON hBig = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
                                    GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
@@ -379,9 +561,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // first sample + layout before showing, so it appears at the right size
     RefreshNow();
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    SyncWindowState(true);
 
     TrayAdd();
     SetTimer(g_hwnd, TIMER_ID, g_cfg.refreshMs, nullptr);
+    SetTimer(g_hwnd, STATE_TIMER_ID, 500, nullptr);
+    g_foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        nullptr, ForegroundChanged, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     TrimWorkingSet();   // trim once the startup allocations have settled
 
     MSG msg;

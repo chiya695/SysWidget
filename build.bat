@@ -92,7 +92,7 @@ if "%DEBUG%"=="1" (
 )
 
 cl %CFLAGS% /Fo"build\\" /Fe"%OUT%" src\*.cpp "build\res_%TARGET%.res" ^
-   /link %LFLAGS% user32.lib gdi32.lib shell32.lib iphlpapi.lib ntdll.lib advapi32.lib comctl32.lib
+   /link %LFLAGS% user32.lib gdi32.lib shell32.lib iphlpapi.lib ntdll.lib advapi32.lib comctl32.lib dwmapi.lib
 if errorlevel 1 (
   echo [error] build failed for %TARGET%
   exit /b 1

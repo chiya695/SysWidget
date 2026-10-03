@@ -7,7 +7,6 @@
 #define IDM_TRAY_BASE      40000
 #define IDM_SHOW_HIDE      (IDM_TRAY_BASE + 1)
 #define IDM_SETTINGS       (IDM_TRAY_BASE + 2)
-#define IDM_TOP_MOST       (IDM_TRAY_BASE + 3)
 #define IDM_CLICK_THROUGH  (IDM_TRAY_BASE + 4)
 #define IDM_AUTOSTART      (IDM_TRAY_BASE + 5)
 #define IDM_EXIT           (IDM_TRAY_BASE + 6)
@@ -22,3 +21,7 @@
 // display-mode radio in the tray menu
 #define IDM_MODE_MINIMAL   (IDM_TRAY_BASE + 20)
 #define IDM_MODE_BARS      (IDM_TRAY_BASE + 21)
+#define IDM_WINDOW_NORMAL (IDM_TRAY_BASE + 30)
+#define IDM_WINDOW_GLOBAL (IDM_TRAY_BASE + 31)
+#define IDM_WINDOW_DESKTOP (IDM_TRAY_BASE + 32)
+#define IDM_HIDE_FULLSCREEN (IDM_TRAY_BASE + 33)

@@ -2,6 +2,7 @@
 #include <windows.h>
 
 enum class DisplayMode { Minimal = 0, Bars = 1 };
+enum class WindowMode { Normal = 0, Global = 1, Desktop = 2 };
 
 // Everything the widget remembers between runs. Plain struct, copied freely.
 struct Config {
@@ -10,7 +11,7 @@ struct Config {
     int  refreshMs          = 1000;    // 500..5000
     int  x                  = 120;
     int  y                  = 120;
-    bool topMost            = true;
+    WindowMode windowMode   = WindowMode::Global;
     bool clickThrough       = false;
     bool autoStart          = false;
     bool hideOnFullscreen   = true;
@@ -34,7 +35,7 @@ void  Config_Path(wchar_t* out, size_t cch);
 
 // Load config.ini; if missing, seed it from config.ini.default (or built-in
 // defaults) and write it out. Never fails hard — falls back to defaults.
-void  Config_Load(Config& c);
+bool  Config_Load(Config& c);
 
 // Persist current values back to config.ini.
-void  Config_Save(const Config& c);
+bool  Config_Save(const Config& c);
